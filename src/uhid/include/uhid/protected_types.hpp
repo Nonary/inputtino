@@ -1,5 +1,6 @@
 #pragma once
 #include <functional>
+#include <atomic>
 #include <inputtino/input.hpp>
 #include <optional>
 #include <uhid/ps5.hpp>
@@ -30,7 +31,7 @@ struct PS5JoypadState {
   uint32_t last_left_trigger_event = 0;
   uint32_t last_right_trigger_event = 0;
 
-  bool stop_repeat_thread = false;
+  std::atomic_bool stop_repeat_thread {false};
   bool is_bluetooth = true;
 };
 } // namespace inputtino

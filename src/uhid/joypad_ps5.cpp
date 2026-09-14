@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <inputtino/input.hpp>
+#include <inputtino/ds5_usb.hpp>
 #include <iomanip>
 #include <random>
 #include <uhid/protected_types.hpp>
@@ -80,75 +81,56 @@ static void on_uhid_event(std::shared_ptr<PS5JoypadState> state, uhid_event ev, 
     answer.type = UHID_GET_REPORT_REPLY;
     answer.u.get_report_reply.id = ev.u.get_report.id;
     answer.u.get_report_reply.err = 0;
-    switch (ev.u.get_report.rnum) {
-    case uhid::PS5_REPORT_TYPES::CALIBRATION: {
-      std::copy(&uhid::ps5_calibration_info[0],
-                &uhid::ps5_calibration_info[0] + sizeof(uhid::ps5_calibration_info),
-                &answer.u.get_report_reply.data[0]);
-      answer.u.get_report_reply.size = sizeof(uhid::ps5_calibration_info);
-      break;
+    ds5_usb::feature_state features;
+    std::reverse_copy(std::begin(state->mac_address), std::end(state->mac_address), features.address.begin());
+    if (ev.u.get_report.rtype == UHID_FEATURE_REPORT) {
+      answer.u.get_report_reply.size = ds5_usb::get_feature(
+          ev.u.get_report.rnum, answer.u.get_report_reply.data,
+          sizeof(answer.u.get_report_reply.data), features);
     }
-    case uhid::PS5_REPORT_TYPES::PAIRING_INFO: {
-      std::copy(&uhid::ps5_pairing_info[0],
-                &uhid::ps5_pairing_info[0] + sizeof(uhid::ps5_pairing_info),
-                &answer.u.get_report_reply.data[0]);
-
-      // Copy MAC address data
-      std::reverse_copy(&state->mac_address[0],
-                        &state->mac_address[0] + sizeof(state->mac_address),
-                        &answer.u.get_report_reply.data[1]);
-
-      answer.u.get_report_reply.size = sizeof(uhid::ps5_pairing_info);
-      break;
-    }
-    case uhid::PS5_REPORT_TYPES::FIRMWARE_INFO: {
-      std::copy(&uhid::ps5_firmware_info[0],
-                &uhid::ps5_firmware_info[0] + sizeof(uhid::ps5_firmware_info),
-                &answer.u.get_report_reply.data[0]);
-      answer.u.get_report_reply.size = sizeof(uhid::ps5_firmware_info);
-      break;
-    }
-    default:
-      answer.u.get_report_reply.err = -EINVAL;
-      break;
-    }
-
-    if (state->is_bluetooth) {
-      // CRC32 encode the data and append it to the reply
-      auto end_of_msg = answer.u.get_report_reply.size - 4; // (Last 4 bytes contains crc32)
-      auto crc = sign_crc32(uhid::PS_FEATURE_CRC32, &answer.u.get_report_reply.data[0], end_of_msg);
-      std::copy(reinterpret_cast<unsigned char *>(&crc),
-                reinterpret_cast<unsigned char *>(&crc) + 4,
-                &answer.u.get_report_reply.data[end_of_msg]);
+    if (!answer.u.get_report_reply.size) {
+      answer.u.get_report_reply.err = EINVAL;
     }
 
     auto res = uhid::uhid_write(fd, &answer);
     // TODO: signal error somehow
     break;
   }
+  case UHID_SET_REPORT: {
+    uhid_event answer{};
+    answer.type = UHID_SET_REPORT_REPLY;
+    answer.u.set_report_reply.id = ev.u.set_report.id;
+    ds5_usb::feature_state features;
+    if (ev.u.set_report.rtype == UHID_FEATURE_REPORT) {
+      if (!ds5_usb::set_feature(ev.u.set_report.rnum, ev.u.set_report.data,
+                                ev.u.set_report.size, features)) {
+        answer.u.set_report_reply.err = EINVAL;
+      }
+    } else if (ev.u.set_report.rtype == UHID_OUTPUT_REPORT &&
+               ev.u.set_report.rnum == uhid::DS_OUTPUT_REPORT_USB &&
+               ev.u.set_report.size >= 48 && ev.u.set_report.data[0] == uhid::DS_OUTPUT_REPORT_USB) {
+      uhid_event output{};
+      output.type = UHID_OUTPUT;
+      output.u.output.size = ev.u.set_report.size;
+      std::copy_n(ev.u.set_report.data, ev.u.set_report.size, output.u.output.data);
+      on_uhid_event(state, output, fd);
+    } else {
+      answer.u.set_report_reply.err = EINVAL;
+    }
+    uhid::uhid_write(fd, &answer);
+    break;
+  }
   case UHID_OUTPUT: { // This is sent if the HID device driver wants to send raw data to the device
     // Here is where we'll get Rumble and LED events
     // Check the first byte to see if it's a USB or BT report
-    uint8_t report_type = ev.u.output.data[0];
-    uhid::dualsense_output_report_common report;
-    if (report_type == uhid::DS_OUTPUT_REPORT_USB) {
-      auto report_usb = (uhid::dualsense_output_report_usb *)ev.u.output.data;
-      report = report_usb->common;
-    } else {
-      uhid::dualsense_output_report_bt *report_bt = (uhid::dualsense_output_report_bt *)ev.u.output.data;
-      /*
-       * SDL2 sets the EnableHID flag and will send the output report straight after
-       * https://github.com/libsdl-org/SDL/blob/c8c4c9772758de2ae466d27f13eb3ed4233e3f32/src/joystick/hidapi/SDL_hidapi_ps5.c#L788-L789
-       *
-       * The Linux kernel instead, sets this as 0, properly set the SeqNo and adds a hardcoded `tag` field before the
-       * actual output report
-       * https://github.com/torvalds/linux/blob/305230142ae0637213bf6e04f6d9f10bbcb74af8/drivers/hid/hid-playstation.c#L1184-L1192
-       */
-      if (report_bt->EnableHID == 0) {
-        report_bt = (uhid::dualsense_output_report_bt *)&ev.u.output.data[1]; // Skip the tag field
-      }
-      report = report_bt->common;
+    // USB output report 2 is 48 bytes. The kernel may pad it to 63;
+    // copy only the common payload and reject incomplete/foreign reports.
+    if (ev.u.output.size < 48 || ev.u.output.data[0] != uhid::DS_OUTPUT_REPORT_USB) {
+      break;
     }
+    uhid::dualsense_output_report_common report{};
+    static_assert(sizeof(report) == 47);
+    std::memcpy(&report, ev.u.output.data + 1, sizeof(report));
 
     /*
      * RUMBLE
@@ -240,23 +222,18 @@ PS5Joypad::~PS5Joypad() {
 }
 
 Result<PS5Joypad> PS5Joypad::create(const DeviceDefinition &device) {
-  bool use_bluetooth = true; // TODO: expose this
+  constexpr bool use_bluetooth = false; // Native games require the USB initialization contract.
 
   auto def = uhid::DeviceDefinition{
       .name = device.name,
       .phys = device.device_phys,
       .uniq = device.device_uniq,
-      .bus = BUS_BLUETOOTH,
+      .bus = BUS_USB,
       .vendor = static_cast<uint32_t>(device.vendor_id),
       .product = static_cast<uint32_t>(device.product_id),
       .version = static_cast<uint32_t>(device.version),
       .country = 0,
-      .report_description = {&uhid::ps5_rdesc_bt[0], &uhid::ps5_rdesc_bt[0] + sizeof(uhid::ps5_rdesc_bt)}};
-
-  if (!use_bluetooth) {
-    def.bus = BUS_USB;
-    def.report_description = {&uhid::ps5_rdesc[0], &uhid::ps5_rdesc[0] + sizeof(uhid::ps5_rdesc)};
-  }
+      .report_description = {std::begin(ds5_usb::report_descriptor), std::end(ds5_usb::report_descriptor)}};
 
   std::array<unsigned char, 6> mac_address = {};
   if (def.uniq.empty()) {
@@ -275,12 +252,13 @@ Result<PS5Joypad> PS5Joypad::create(const DeviceDefinition &device) {
   auto joypad = PS5Joypad(device.vendor_id, mac_address);
 
   if (def.phys.empty()) {
-    def.phys = "INPUTTINO_BT_LINK";
+    def.phys = "INPUTTINO_USB_LINK";
   }
   if (def.uniq.empty()) {
     def.uniq = joypad.get_mac_address();
   }
 
+  joypad._state->is_bluetooth = use_bluetooth;
   auto dev =
       uhid::Device::create(def, [state = joypad._state](uhid_event ev, int fd) { on_uhid_event(state, ev, fd); });
   if (dev) {
@@ -294,7 +272,7 @@ Result<PS5Joypad> PS5Joypad::create(const DeviceDefinition &device) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
       }
     });
-    joypad._send_input_thread.detach();
+
 
     return joypad;
   }
@@ -505,24 +483,25 @@ void PS5Joypad::set_on_rumble(const std::function<void(int, int)> &callback) {
  * For a rationale behind this, see: https://github.com/LizardByte/Sunshine/issues/3247#issuecomment-2428065349
  */
 static __le16 to_le_signed(float original, float value) {
+  if (!std::isfinite(value)) value = 0;
   value = std::clamp(value, static_cast<float>(SHRT_MIN), static_cast<float>(SHRT_MAX));
-  return htole16(value);
+  return htole16(static_cast<int16_t>(std::lround(value)));
 }
 
 void PS5Joypad::set_motion(PS5Joypad::MOTION_TYPE type, float x, float y, float z) {
   switch (type) {
   case ACCELERATION: {
-    this->_state->current_state.accel[0] = to_le_signed(x, (x * uhid::SDL_STANDARD_GRAVITY_CONST * 100));
-    this->_state->current_state.accel[1] = to_le_signed(y, (y * uhid::SDL_STANDARD_GRAVITY_CONST * 100));
-    this->_state->current_state.accel[2] = to_le_signed(z, (z * uhid::SDL_STANDARD_GRAVITY_CONST * 100));
+    this->_state->current_state.accel[0] = to_le_signed(x, (x / uhid::SDL_STANDARD_GRAVITY_CONST * 8192));
+    this->_state->current_state.accel[1] = to_le_signed(y, (y / uhid::SDL_STANDARD_GRAVITY_CONST * 8192));
+    this->_state->current_state.accel[2] = to_le_signed(z, (z / uhid::SDL_STANDARD_GRAVITY_CONST * 8192));
 
     send_report(*this->_state);
     break;
   }
   case GYROSCOPE: {
-    this->_state->current_state.gyro[0] = to_le_signed(x, x * uhid::gyro_resolution);
-    this->_state->current_state.gyro[1] = to_le_signed(y, y * uhid::gyro_resolution);
-    this->_state->current_state.gyro[2] = to_le_signed(z, z * uhid::gyro_resolution);
+    this->_state->current_state.gyro[0] = to_le_signed(x, x * (16.0f * 180.0f / 3.14159265358979323846f));
+    this->_state->current_state.gyro[1] = to_le_signed(y, y * (16.0f * 180.0f / 3.14159265358979323846f));
+    this->_state->current_state.gyro[2] = to_le_signed(z, z * (16.0f * 180.0f / 3.14159265358979323846f));
 
     send_report(*this->_state);
     break;

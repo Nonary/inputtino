@@ -442,9 +442,9 @@ struct dualsense_input_report_bt_header {
 constexpr size_t PS_INPUT_REPORT_BT_OFFSET = 13;
 
 struct dualsense_input_report {
-  uint8_t x, y = PS5_AXIS_NEUTRAL;   // LS
-  uint8_t rx, ry = PS5_AXIS_NEUTRAL; // RS
-  uint8_t z, rz = PS5_AXIS_NEUTRAL;  // L2, R2
+  uint8_t x = PS5_AXIS_NEUTRAL, y = PS5_AXIS_NEUTRAL;   // LS
+  uint8_t rx = PS5_AXIS_NEUTRAL, ry = PS5_AXIS_NEUTRAL; // RS
+  uint8_t z = 0, rz = 0;  // L2, R2
   uint8_t seq_number = 0;
   // HAT_SWITCH is neutral when 0x8 is reported
   uint8_t buttons[4] = {HAT_NEUTRAL, 0, 0, 0};
