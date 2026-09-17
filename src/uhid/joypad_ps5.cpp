@@ -2,6 +2,7 @@
 #include <climits>
 #include <cmath>
 #include <crc32.hpp>
+#include <cstring>
 #include <endian.h>
 #include <filesystem>
 #include <fstream>
@@ -19,6 +20,43 @@ static uint32_t sign_crc32(uint32_t seed, const unsigned char *buffer, size_t le
   auto crc = CRC32(buffer, length, seed);
   crc = htole32(crc); // Convert to little endian
   return crc;
+}
+
+static bool parse_ds5_output(const uhid_event &ev, uhid::dualsense_output_report_common &report) {
+  const auto *data = ev.u.output.data;
+  const auto size = ev.u.output.size;
+  if (data == nullptr || size == 0) {
+    return false;
+  }
+
+  static_assert(sizeof(report) == 47);
+
+  if (data[0] == uhid::DS_OUTPUT_REPORT_USB) {
+    if (size < 1 + sizeof(report)) {
+      return false;
+    }
+    std::memcpy(&report, data + 1, sizeof(report));
+    return true;
+  }
+
+  if (data[0] != uhid::DS_OUTPUT_REPORT_BT) {
+    return false;
+  }
+
+  // hid-playstation and libScePad: 0x31, seq, tag 0x10, then the USB common
+  // payload. SDL2 sets EnableHID and places common at offset 2.
+  if (size >= 3 + sizeof(report) && data[2] == 0x10) {
+    std::memcpy(&report, data + 3, sizeof(report));
+    return true;
+  }
+
+  auto *report_bt = reinterpret_cast<const uhid::dualsense_output_report_bt *>(data);
+  const unsigned offset = report_bt->EnableHID ? 2u : 3u;
+  if (size < offset + sizeof(report)) {
+    return false;
+  }
+  std::memcpy(&report, data + offset, sizeof(report));
+  return true;
 }
 
 static void send_report(PS5JoypadState &state) {
@@ -122,15 +160,10 @@ static void on_uhid_event(std::shared_ptr<PS5JoypadState> state, uhid_event ev, 
   }
   case UHID_OUTPUT: { // This is sent if the HID device driver wants to send raw data to the device
     // Here is where we'll get Rumble and LED events
-    // Check the first byte to see if it's a USB or BT report
-    // USB output report 2 is 48 bytes. The kernel may pad it to 63;
-    // copy only the common payload and reject incomplete/foreign reports.
-    if (ev.u.output.size < 48 || ev.u.output.data[0] != uhid::DS_OUTPUT_REPORT_USB) {
+    uhid::dualsense_output_report_common report{};
+    if (!parse_ds5_output(ev, report)) {
       break;
     }
-    uhid::dualsense_output_report_common report{};
-    static_assert(sizeof(report) == 47);
-    std::memcpy(&report, ev.u.output.data + 1, sizeof(report));
 
     /*
      * RUMBLE
