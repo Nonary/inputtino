@@ -391,6 +391,12 @@ public:
 
   std::string get_mac_address() const;
 
+  // Composite DS5 USB audio: 48 kHz, S16LE, four interleaved channels.
+  // Channels 3/4 are left/right actuator waveforms. Data is borrowed only for
+  // the call. Installing this callback replaces PCM-to-rumble conversion;
+  // normal HID rumble output still uses set_on_rumble().
+  void set_on_haptics(const std::function<void(const unsigned char *, std::size_t)> &callback);
+
   std::vector<std::string> get_sys_nodes() const;
 
   void set_pressed_buttons(unsigned int newly_pressed) override;

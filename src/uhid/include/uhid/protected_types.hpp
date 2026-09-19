@@ -3,12 +3,16 @@
 #include <atomic>
 #include <inputtino/input.hpp>
 #include <optional>
+#include <mutex>
+#include <thread>
 #include <uhid/ps5.hpp>
 #include <uhid/uhid.hpp>
 
 namespace inputtino {
 struct PS5JoypadState {
   std::shared_ptr<uhid::Device> dev;
+  int gadget_fd = -1;
+  int gadget_slot = -1;
   /**
    * This will be the MAC address of the device
    *
@@ -26,6 +30,8 @@ struct PS5JoypadState {
   uint8_t last_touch_id = 0;
 
   std::optional<std::function<void(int, int)>> on_rumble = std::nullopt;
+  std::mutex haptics_mutex;
+  std::function<void(const unsigned char *, std::size_t)> on_haptics;
   std::optional<std::function<void(int, int, int)>> on_led = std::nullopt;
   std::optional<std::function<void(const PS5Joypad::TriggerEffect &)>> on_trigger_effect = std::nullopt;
   uint32_t last_left_trigger_event = 0;
@@ -33,5 +39,6 @@ struct PS5JoypadState {
 
   std::atomic_bool stop_repeat_thread {false};
   bool is_bluetooth = true;
+  std::thread gadget_thread;
 };
 } // namespace inputtino
