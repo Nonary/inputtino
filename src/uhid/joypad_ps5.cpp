@@ -1,17 +1,27 @@
 #include <algorithm>
+#include <cerrno>
+#include <cstdint>
 #include <climits>
 #include <cmath>
+#include <cstring>
+#include <iostream>
 #include <crc32.hpp>
 #include <endian.h>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <inputtino/input.hpp>
 #include <inputtino/ds5_usb.hpp>
 #include <iomanip>
+#include <numeric>
+#include <poll.h>
 #include <random>
+#include <sys/ioctl.h>
+#include <unistd.h>
 #include <uhid/protected_types.hpp>
 #include <uhid/ps5.hpp>
 #include <uhid/uhid.hpp>
+#include "../../../libvirtualgamepad/linux/vibeshine-ds5/vibeshine_ds5_uapi.h"
 
 namespace inputtino {
 
@@ -71,6 +81,17 @@ static void send_report(PS5JoypadState &state) {
               &ev.u.input2.data[end_of_msg]);
   }
 
+  if (state.gadget_fd >= 0) {
+    unsigned char report[VIBESHINE_DS5_INPUT_SIZE] = {};
+    std::size_t header_size = sizeof(uhid::dualsense_input_report_usb_header);
+    auto header = uhid::dualsense_input_report_usb_header{};
+    std::copy(reinterpret_cast<unsigned char *>(&header),
+              reinterpret_cast<unsigned char *>(&header) + header_size, report);
+    unsigned char *data = (unsigned char *)&state.current_state;
+    std::copy(data, data + sizeof(state.current_state), report + header_size);
+    (void)!write(state.gadget_fd, report, sizeof(report));
+    return;
+  }
   state.dev->send(ev);
 }
 
@@ -210,14 +231,100 @@ PS5Joypad::PS5Joypad(uint16_t vendor_id, std::array<unsigned char, 6> mac_addres
   this->_state->current_state.battery_status = BATTERY_FULL;
 }
 
-PS5Joypad::~PS5Joypad() {
-  if (this->_state && this->_state->dev) {
-    this->_state->stop_repeat_thread = true;
-    if (this->_send_input_thread.joinable()) {
-      this->_send_input_thread.join();
+static void apply_ds5_hid_output(const std::shared_ptr<PS5JoypadState> &state, const unsigned char *data, std::size_t size) {
+  if (size < 48 || data[0] != uhid::DS_OUTPUT_REPORT_USB) {
+    return;
+  }
+  uhid_event ev{};
+  ev.type = UHID_OUTPUT;
+  ev.u.output.size = static_cast<__u16>(std::min(size, sizeof(ev.u.output.data)));
+  std::copy_n(data, ev.u.output.size, ev.u.output.data);
+  on_uhid_event(state, ev, -1);
+}
+
+static void apply_ds5_pcm_rumble(const std::shared_ptr<PS5JoypadState> &state, const unsigned char *data, std::size_t size) {
+  std::function<void(const unsigned char *, std::size_t)> haptics;
+  {
+    std::lock_guard<std::mutex> guard(state->haptics_mutex);
+    haptics = state->on_haptics;
+  }
+  if (haptics) {
+    if (size && size % VIBESHINE_DS5_PCM_FRAME_BYTES == 0) haptics(data, size);
+    return;
+  }
+  if (!state->on_rumble || size < VIBESHINE_DS5_PCM_FRAME_BYTES) {
+    return;
+  }
+  const auto *samples = reinterpret_cast<const std::int16_t *>(data);
+  const std::size_t frames = size / VIBESHINE_DS5_PCM_FRAME_BYTES;
+  double sum_l = 0;
+  double sum_r = 0;
+  for (std::size_t i = 0; i < frames; ++i) {
+    const double rl = samples[i * 4 + 2] / 32768.0;
+    const double rr = samples[i * 4 + 3] / 32768.0;
+    sum_l += rl * rl;
+    sum_r += rr * rr;
+  }
+  const auto to_motor = [](double mean_square) {
+    const double rms = std::sqrt(mean_square);
+    const int mag = static_cast<int>(std::clamp(rms * 4.0, 0.0, 1.0) * 0xFFFF);
+    return mag;
+  };
+  (*state->on_rumble)(to_motor(sum_l / static_cast<double>(frames)),
+                      to_motor(sum_r / static_cast<double>(frames)));
+}
+
+static void gadget_event_loop(std::shared_ptr<PS5JoypadState> state) {
+  // Keep the descriptor alive until this thread has joined. Closing it from
+  // another thread does not cancel a blocking read on the gadget driver.
+  pollfd pending{state->gadget_fd, POLLIN, 0};
+  while (!state->stop_repeat_thread) {
+    const int ready = poll(&pending, 1, 50);
+    if (state->stop_repeat_thread) {
+      break;
     }
+    if (ready < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+    if (ready == 0) continue;
+    if (pending.revents & (POLLERR | POLLHUP | POLLNVAL)) break;
+    if (!(pending.revents & POLLIN)) continue;
+    vibeshine_ds5_event ev{};
+    const ssize_t n = read(state->gadget_fd, &ev, sizeof(ev));
+    if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
+    if (n <= 0) break;
+    if (n != static_cast<ssize_t>(sizeof(ev)) || ev.size > sizeof(ev.data)) {
+      continue;
+    }
+    if (ev.type == VIBESHINE_DS5_EVENT_OUTPUT) {
+      apply_ds5_hid_output(state, ev.data, ev.size);
+    } else if (ev.type == VIBESHINE_DS5_EVENT_PCM) {
+      apply_ds5_pcm_rumble(state, ev.data, ev.size);
+    }
+  }
+}
+
+PS5Joypad::~PS5Joypad() {
+  if (!this->_state) {
+    return;
+  }
+  this->_state->stop_repeat_thread = true;
+  if (this->_state->gadget_thread.joinable()) {
+    this->_state->gadget_thread.join();
+  }
+  if (this->_send_input_thread.joinable()) {
+    this->_send_input_thread.join();
+  }
+  // Both workers must stop before destroying the slot or reusing its fd.
+  if (this->_state->gadget_fd >= 0) {
+    ioctl(this->_state->gadget_fd, VIBESHINE_DS5_DESTROY);
+    close(this->_state->gadget_fd);
+    this->_state->gadget_fd = -1;
+  }
+  if (this->_state->dev) {
     this->_state->dev->stop_thread();
-    this->_state->dev.reset(); // Will trigger ~Device and ultimately destroy the device
+    this->_state->dev.reset();
   }
 }
 
@@ -259,6 +366,31 @@ Result<PS5Joypad> PS5Joypad::create(const DeviceDefinition &device) {
   }
 
   joypad._state->is_bluetooth = use_bluetooth;
+
+  const int gadget_fd = open("/dev/vibeshine-ds5", O_RDWR | O_CLOEXEC | O_NONBLOCK);
+  if (gadget_fd < 0) {
+    std::cerr << "DualSense USB gadget open(/dev/vibeshine-ds5) failed: " << strerror(errno) << '\n';
+  } else {
+    vibeshine_ds5_create create{};
+    create.slot = static_cast<__u32>(mac_address[5] % VIBESHINE_DS5_SLOTS);
+    std::copy(mac_address.begin(), mac_address.end(), create.mac);
+    if (ioctl(gadget_fd, VIBESHINE_DS5_CREATE, &create) != 0) {
+      std::cerr << "DualSense USB gadget CREATE failed: " << strerror(errno) << '\n';
+      close(gadget_fd);
+    } else {
+      joypad._state->gadget_fd = gadget_fd;
+      joypad._state->gadget_slot = static_cast<int>(create.slot);
+      joypad._state->gadget_thread = std::thread([state = joypad._state]() { gadget_event_loop(state); });
+      joypad._send_input_thread = std::thread([state = joypad._state]() {
+        while (!state->stop_repeat_thread) {
+          send_report(*state);
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+      });
+      return joypad;
+    }
+  }
+
   auto dev =
       uhid::Device::create(def, [state = joypad._state](uhid_event ev, int fd) { on_uhid_event(state, ev, fd); });
   if (dev) {
@@ -308,6 +440,31 @@ std::string PS5Joypad::get_mac_address() const {
  */
 std::vector<std::string> PS5Joypad::get_sys_nodes() const {
   std::vector<std::string> nodes;
+  if (_state && _state->gadget_fd >= 0) {
+    const auto usb_root = std::filesystem::path("/sys/bus/usb/devices");
+    if (std::filesystem::exists(usb_root)) {
+      for (const auto &entry : std::filesystem::directory_iterator{usb_root}) {
+        std::ifstream vendor{entry.path() / "idVendor"};
+        std::ifstream product{entry.path() / "idProduct"};
+        std::string vid, pid;
+        if (!(vendor >> vid) || !(product >> pid)) {
+          continue;
+        }
+        if (vid != "054c" || pid != "0ce6") {
+          continue;
+        }
+        auto hid_root = entry.path();
+        if (std::filesystem::exists(hid_root / "input")) {
+          for (const auto &input_entry : std::filesystem::directory_iterator{hid_root / "input"}) {
+            if (input_entry.is_directory()) {
+              nodes.push_back(input_entry.path().string());
+            }
+          }
+        }
+      }
+    }
+    return nodes;
+  }
   auto base_path = "/sys/devices/virtual/misc/uhid/";
   auto target_mac = get_mac_address();
   if (std::filesystem::exists(base_path)) {
@@ -477,6 +634,11 @@ void PS5Joypad::set_stick(Joypad::STICK_POSITION stick_type, short x, short y) {
 }
 void PS5Joypad::set_on_rumble(const std::function<void(int, int)> &callback) {
   this->_state->on_rumble = callback;
+}
+
+void PS5Joypad::set_on_haptics(const std::function<void(const unsigned char *, std::size_t)> &callback) {
+  std::lock_guard<std::mutex> guard(_state->haptics_mutex);
+  _state->on_haptics = callback;
 }
 
 /**
