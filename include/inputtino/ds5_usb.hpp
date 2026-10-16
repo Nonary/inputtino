@@ -59,7 +59,7 @@ inline constexpr std::array<std::uint8_t, 64> firmware = {
   0x03, 0x00, 0x44, 0x00, 0x08, 0x02, 0x00, 0x01,
   0x3e, 0x00, 0x00, 0x01,
   0xC1, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x90, 0x03, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00,
+  0x30, 0x06, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00,
   0x0B, 0x00, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
 static_assert(firmware.size() == 64);
@@ -67,6 +67,9 @@ static_assert(firmware[20] != 0 && firmware[31] == 0x01);
 // libScePad checks UpdateVersion separately from FirmwareVersion. Older
 // captured firmware (0x0154 here) requests an update in 007 First Light.
 static_assert((firmware[44] | (firmware[45] << 8)) >= 0x0390);
+// Steam reads this LE16 UpdateVersion through SDL independently of the build
+// date and offset-28 FirmwareVersion. Match the reviewed DualSense threshold.
+static_assert((firmware[44] | (firmware[45] << 8)) >= 0x0630);
 struct feature_state {
   // Least-significant wire octet first, unique per controller slot. The final
   // octet has the locally administered bit and no multicast bit.
